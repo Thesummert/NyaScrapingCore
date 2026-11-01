@@ -9,6 +9,11 @@ uninstall <工具> <版本>          删除本工具管理的指定版本（也�
 use <工具> <版本|system>         保存选择；system 选择 PATH 中的第一个程序
 which <工具>                     输出当前选择的可执行文件路径
 paths                            显示配置文件及安装目录
+gdbserver <工具> --target <目标> [--interface <文件>] [--port <端口>] [--dry-run]
+flash <工具> --target <目标> --file <固件> [--interface <文件>] [--dry-run]
+erase <工具> --target <目标> [--interface <文件>] [--bank <编号>] [--dry-run]
+reset <工具> --target <目标> [--interface <文件>] [--dry-run]
+debug <工具> --target <目标> --file <ELF> [--interface <文件>] [--port <端口>] [--gdb <程序>] [--dry-run]
 ```
 
 例如：
@@ -21,7 +26,18 @@ nsc use openocd 0.12.0-7
 nsc use pyocd system
 nsc list
 nsc uninstall openocd 0.12.0-7
+nsc gdbserver openocd --interface interface/stlink.cfg --target target/stm32f4x.cfg
+nsc gdbserver pyocd --target stm32f407vg --port 3333
+nsc gdbserver probe-rs --target STM32F407VG --port 3333
+nsc flash pyocd --target stm32f407vg --file build/app.elf
+nsc erase openocd --interface interface/stlink.cfg --target target/stm32f4x.cfg --bank 0
+nsc reset probe-rs --target STM32F407VG
+nsc debug probe-rs --target STM32F407VG --file build/app.elf
 ```
+
+`gdbserver` 对三种工具使用同一命令格式，启动前会根据 `use` 保存的选择寻找可执行文件；未选择时使用 PATH。`--port` 默认为 3333，允许 1 到 65535。OpenOCD 必须提供 `--interface`，其 `--target` 是目标配置文件；pyOCD 和 probe-rs 的 `--target` 是芯片名，不接受 `--interface`。`--dry-run` 只打印要执行的进程及参数。启动后，服务在前台运行，可从另一个终端用 GDB 连接 `localhost:3333`（或指定端口）。库调用方可使用 `backend::gdbserver_command` 和 `GdbServerOptions` 构造对应的 `std::process::Command`。
+
+`flash` 烧录并校验固件；OpenOCD 使用其 `program ... verify reset exit` 流程，固件应为 ELF、HEX 或 S19，其他格式按各工具支持情况使用。`erase` 对 pyOCD 和 probe-rs 执行芯片擦除；OpenOCD 必须用 `--bank` 指定要擦除的 flash bank 编号，可用原生 `flash banks` 查看。擦除有目标芯片差异，执行前建议先用 `--dry-run` 核对命令。`reset` 复位目标。`debug` 启动 GDB 服务、等待端口可连接、打开 `arm-none-eabi-gdb` 并自动执行 `target remote localhost:<端口>`，GDB 退出时关闭服务；可用 `--gdb` 指定其他 GDB 程序。库调用方可使用 `backend::operation_command` 和 `Operation` 构造烧录、擦除及复位命令，并使用 `session::run` 管理调试会话。
 
 省略版本时会查询对应软件源的最新稳定版，OpenOCD 选择包含当前平台二进制文件的最新 xPack 正式发布。下载和构建进度由 curl、pip 或 Cargo 显示，具体形式取决于工具和终端；probe-rs 从源码构建，Cargo 的进度包含编译阶段。
 
