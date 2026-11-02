@@ -16,6 +16,7 @@ NyaScrapingCore/
     ├── main.rs         # 命令行程序入口
     ├── lib.rs          # 核心库入口
     ├── cli/            # 命令行解析
+    ├── gdbserver.rs     # 统一 GDB 服务配置和进程生命周期
     ├── session/        # GDB 会话管理
     └── backend/        # 外部工具命令适配
         ├── openocd.rs
@@ -23,7 +24,7 @@ NyaScrapingCore/
         └── probers.rs
 ```
 
-核心库和程序入口分开，以便其他界面复用核心能力。各后端生成对应工具命令；会话模块管理 GDB 服务和客户端进程；命令行模块负责用户输入。
+核心库和程序入口分开，以便其他界面复用核心能力。各后端通过 `DebugBackend` 接口生成对应工具命令；`GdbServer` 和 `RunningGdbServer` 统一配置和管理服务进程，会话模块管理 GDB 客户端；命令行模块负责用户输入。
 
 ## 构建与运行
 

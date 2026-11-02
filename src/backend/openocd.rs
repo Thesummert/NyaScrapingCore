@@ -48,3 +48,32 @@ pub fn operation_command(
     command.arg("-c").arg(script);
     Ok(command)
 }
+
+/// Adapter for OpenOCD middleware.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenOcd;
+
+impl super::DebugBackend for OpenOcd {
+    fn tool(&self) -> crate::manager::Tool {
+        crate::manager::Tool::OpenOcd
+    }
+
+    fn gdbserver_command(
+        &self,
+        executable: &Path,
+        options: &GdbServerOptions,
+    ) -> super::Result<Command> {
+        options.validate(self.tool())?;
+        Ok(gdbserver_command(executable, options))
+    }
+
+    fn operation_command(
+        &self,
+        executable: &Path,
+        options: &GdbServerOptions,
+        operation: &Operation,
+    ) -> super::Result<Command> {
+        super::validate_operation(self.tool(), options, operation)?;
+        operation_command(executable, options, operation)
+    }
+}

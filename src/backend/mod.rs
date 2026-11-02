@@ -13,6 +13,28 @@ pub mod pyocd;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+/// Object-safe interface shared by all debugger middleware adapters.
+/// Implementations validate options before constructing a command and never spawn it.
+pub trait DebugBackend: Send + Sync {
+    fn tool(&self) -> Tool;
+    fn gdbserver_command(&self, executable: &Path, options: &GdbServerOptions) -> Result<Command>;
+    fn operation_command(
+        &self,
+        executable: &Path,
+        options: &GdbServerOptions,
+        operation: &Operation,
+    ) -> Result<Command>;
+}
+
+/// Select a built-in adapter without allocating or starting an external tool.
+pub fn backend(tool: Tool) -> &'static dyn DebugBackend {
+    match tool {
+        Tool::OpenOcd => &openocd::OpenOcd,
+        Tool::PyOcd => &pyocd::PyOcd,
+        Tool::ProbeRs => &probers::ProbeRs,
+    }
+}
+
 /// `target` is an OpenOCD target configuration file or a pyOCD/probe-rs chip name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GdbServerOptions {
@@ -46,12 +68,7 @@ pub fn gdbserver_command(
     executable: &Path,
     options: &GdbServerOptions,
 ) -> Result<Command> {
-    options.validate(tool)?;
-    Ok(match tool {
-        Tool::OpenOcd => openocd::gdbserver_command(executable, options),
-        Tool::PyOcd => pyocd::gdbserver_command(executable, options),
-        Tool::ProbeRs => probers::gdbserver_command(executable, options),
-    })
+    backend(tool).gdbserver_command(executable, options)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +85,10 @@ pub fn operation_command(
     options: &GdbServerOptions,
     operation: &Operation,
 ) -> Result<Command> {
+    backend(tool).operation_command(executable, options, operation)
+}
+
+fn validate_operation(tool: Tool, options: &GdbServerOptions, operation: &Operation) -> Result<()> {
     options.validate(tool)?;
     match operation {
         Operation::Flash(path) if !path.is_file() => {
@@ -81,16 +102,33 @@ pub fn operation_command(
         }
         _ => {}
     }
-    match tool {
-        Tool::OpenOcd => openocd::operation_command(executable, options, operation),
-        Tool::PyOcd => Ok(pyocd::operation_command(executable, options, operation)),
-        Tool::ProbeRs => Ok(probers::operation_command(executable, options, operation)),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapters_validate_direct_trait_calls() {
+        let executable = Path::new("debugger");
+        for tool in Tool::ALL {
+            let adapter: &dyn DebugBackend = backend(tool);
+            assert_eq!(adapter.tool(), tool);
+            let options = GdbServerOptions {
+                target: "chip".into(),
+                interface: (tool == Tool::OpenOcd).then(|| "interface.cfg".into()),
+                port: 3333,
+            };
+            let invalid_erase = Operation::Erase {
+                bank: if tool == Tool::OpenOcd { None } else { Some(0) },
+            };
+            assert!(adapter.operation_command(executable, &options, &invalid_erase).is_err());
+            let mut invalid = options;
+            invalid.port = 0;
+            assert!(adapter.gdbserver_command(executable, &invalid).is_err());
+        }
+    }
 
     #[test]
     fn builds_all_three_gdb_servers() {

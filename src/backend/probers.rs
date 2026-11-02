@@ -30,3 +30,32 @@ pub fn operation_command(
     }
     command
 }
+
+/// Adapter for probe-rs middleware.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeRs;
+
+impl super::DebugBackend for ProbeRs {
+    fn tool(&self) -> crate::manager::Tool {
+        crate::manager::Tool::ProbeRs
+    }
+
+    fn gdbserver_command(
+        &self,
+        executable: &Path,
+        options: &GdbServerOptions,
+    ) -> super::Result<Command> {
+        options.validate(self.tool())?;
+        Ok(gdbserver_command(executable, options))
+    }
+
+    fn operation_command(
+        &self,
+        executable: &Path,
+        options: &GdbServerOptions,
+        operation: &Operation,
+    ) -> super::Result<Command> {
+        super::validate_operation(self.tool(), options, operation)?;
+        Ok(operation_command(executable, options, operation))
+    }
+}

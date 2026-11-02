@@ -48,3 +48,46 @@ nsc debug probe-rs --target STM32F407VG --file build/app.elf
 配置默认存于 Windows `%APPDATA%/NyaScrapingCore/config`、macOS `~/Library/Application Support/NyaScrapingCore/config`，或 Linux `$XDG_CONFIG_HOME/NyaScrapingCore/config`（默认 `~/.config`）。安装文件分别存于 Windows `%LOCALAPPDATA%/NyaScrapingCore/debuggers`、macOS `~/Library/Application Support/NyaScrapingCore/debuggers`，或 Linux `$XDG_DATA_HOME/NyaScrapingCore/debuggers`（默认 `~/.local/share`）。
 
 OpenOCD 使用 [xPack 二进制发布包](https://xpack.github.io/openocd/install/)，版本需填写其发布版本，如 `0.12.0-7`；需要 `curl` 和支持该压缩格式的 `tar`。pyOCD 使用 [Python 虚拟环境和 pip](https://pyocd.io/docs/installing)，需要 Python 和 venv/pip。probe-rs 使用 [cargo install](https://probe.rs/docs/getting-started/installation/)，需要 Rust 工具链及平台构建依赖，编译可能耗时。安装均需要访问相应的软件源；版本和平台必须有对应的发行包。安装失败会清理本次创建的版本目录，不会覆盖已有目录。
+
+## GDB server 抽象层（Rust）
+
+`backend::DebugBackend` 提供统一的 `tool()`、`gdbserver_command()` 和
+`operation_command()` 接口。内置实现为 `openocd::OpenOcd`、`pyocd::PyOcd`、
+`probers::ProbeRs`，可通过 `backend::backend(tool)` 获取 `&dyn DebugBackend`。
+原有 `backend::gdbserver_command` 和 `operation_command` 保留，内部委托给对应实现。
+
+`gdbserver::GdbServer` 统一配置和启动入口，`RunningGdbServer` 管理进程：
+
+```rust,no_run
+use nya_scraping_core::{
+    backend::GdbServerOptions,
+    gdbserver::GdbServer,
+    manager::{Manager, Tool},
+};
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = Manager::new()?;
+    let server = GdbServer::resolve(&manager, Tool::PyOcd, GdbServerOptions {
+        target: "stm32f407vg".into(),
+        interface: None,
+        port: 3333,
+    })?;
+    println!("{:?}", server.command()?); // 仅构造命令，不启动进程
+    let mut running = server.start(Duration::from_secs(10))?;
+    println!("PID: {}, GDB 地址: {}", running.id(), running.address());
+    // 调用方在这里连接 GDB、执行调试；try_wait() 可查询进程是否退出。
+    running.stop()?;
+    Ok(())
+}
+```
+
+也可用 `GdbServer::new(tool, executable, options)` 显式指定程序，或用
+`GdbServer::with_backend` 注入自定义适配器。需要设置日志输出、环境变量等时，先修改
+`server.command()?` 返回的 `Command`，再交给 `RunningGdbServer::start`。
+
+`start` 检查本机端口、启动进程并等待 TCP 连接成功；端口占用、启动失败、进程提前退出
+或等待超时均返回错误。就绪检查只代表 TCP 端口可连接，不验证芯片状态或 GDB 协议；
+端口检查和子进程绑定之间仍存在竞争窗口。服务句柄支持 `id`、`address`、`try_wait`、
+`wait` 和可重复调用的 `stop`；句柄离开作用域时终止并回收直接子进程。
+`session::run` 已复用此生命周期实现，GDB 客户端退出或启动失败时会清理服务。

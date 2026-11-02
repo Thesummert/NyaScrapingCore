@@ -1,5 +1,6 @@
 use crate::{
     backend::{self, GdbServerOptions, Operation},
+    gdbserver::GdbServer,
     manager::{Manager, Tool},
     session,
 };
@@ -52,9 +53,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("gdbserver does not accept --file, --bank, or --gdb".into());
             }
             let options = parsed.server;
-            options.validate(tool)?;
-            let executable = manager.resolve(tool)?;
-            let mut command = backend::gdbserver_command(tool, &executable, &options)?;
+            let server = GdbServer::resolve(&manager, tool, options)?;
+            let mut command = server.command()?;
             if parsed.dry_run {
                 println!("{command:?}");
             } else {
@@ -79,7 +79,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if !elf.is_file() {
                     return Err(format!("ELF file does not exist: {}", elf.display()).into());
                 }
-                let command = backend::gdbserver_command(tool, &executable, &parsed.server)?;
+                let server = GdbServer::new(tool, &executable, parsed.server.clone())?;
+                let command = server.command()?;
                 let gdb = parsed.gdb.unwrap_or_else(|| "arm-none-eabi-gdb".into());
                 if parsed.dry_run {
                     println!(

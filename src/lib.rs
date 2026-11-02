@@ -5,5 +5,6 @@
 
 pub mod backend;
 pub mod cli;
+pub mod gdbserver;
 pub mod manager;
 pub mod session;
