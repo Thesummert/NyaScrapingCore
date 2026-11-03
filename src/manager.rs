@@ -349,6 +349,8 @@ impl Manager {
                 Tool::ProbeRs => {
                     run(Command::new("cargo")
                         .env("CARGO_TERM_PROGRESS_WHEN", "always")
+                        // Cargo requires an explicit width when progress is forced.
+                        .env("CARGO_TERM_PROGRESS_WIDTH", "80")
                         .args([
                             "install",
                             "probe-rs-tools",
