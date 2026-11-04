@@ -123,7 +123,9 @@ mod tests {
             let invalid_erase = Operation::Erase {
                 bank: if tool == Tool::OpenOcd { None } else { Some(0) },
             };
-            assert!(adapter.operation_command(executable, &options, &invalid_erase).is_err());
+            assert!(adapter
+                .operation_command(executable, &options, &invalid_erase)
+                .is_err());
             let mut invalid = options;
             invalid.port = 0;
             assert!(adapter.gdbserver_command(executable, &invalid).is_err());
