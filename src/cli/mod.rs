@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "help" || args[0] == "--help" {
-        println!("nsc debugger management\n\n  list [openocd|pyocd|probe-rs]\n  install <tool> [version]\n  uninstall <tool> <version>\n  use <tool> <version|system>\n  which <tool>\n  paths\n  gdbserver <tool> --target <target> [--interface <config>] [--port <port>] [--dry-run]\n  flash <tool> --target <target> --file <firmware> [--interface <config>] [--dry-run]\n  erase <tool> --target <target> [--interface <config>] [--bank <number>] [--dry-run]\n  reset <tool> --target <target> [--interface <config>] [--dry-run]\n  debug <tool> --target <target> --file <elf> [--interface <config>] [--port <port>] [--gdb <program>] [--dry-run]\n\nOpenOCD requires --interface; its --target is a target config. OpenOCD erase requires --bank. For pyOCD and probe-rs, --target is a chip name. Default port: 3333. Default GDB client: arm-none-eabi-gdb.");
+        println!("nsc debugger management\n\n  list [openocd|pyocd|probe-rs]\n  install <tool> [version]\n  uninstall <tool> <version>\n  add-local <tool> <name> <directory>\n  remove-local <tool> <name>\n  use <tool> <version|system|local:name>\n  which <tool>\n  paths\n  gdbserver <tool> --target <target> [--interface <config>] [--port <port>] [--dry-run]\n  flash <tool> --target <target> --file <firmware> [--interface <config>] [--dry-run]\n  erase <tool> --target <target> [--interface <config>] [--bank <number>] [--dry-run]\n  reset <tool> --target <target> [--interface <config>] [--dry-run]\n  debug <tool> --target <target> --file <elf> [--interface <config>] [--port <port>] [--gdb <program>] [--dry-run]\n\nOpenOCD requires --interface; its --target is a target config. OpenOCD erase requires --bank. For pyOCD and probe-rs, --target is a chip name. Default port: 3333. Default GDB client: arm-none-eabi-gdb.");
         return Ok(());
     }
     let manager = Manager::new()?;
@@ -34,6 +34,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (version, path) in manager.installed(tool)? {
                     println!("  {version}: {}", path.display());
                 }
+                for (name, path) in manager.local(tool)? {
+                    println!(
+                        "  local:{name}: {}{}",
+                        path.display(),
+                        if path.is_file() { "" } else { " (missing)" }
+                    );
+                }
                 for path in manager.system(tool) {
                     println!("  system: {} ({})", path.display(), manager.version(&path));
                 }
@@ -41,6 +48,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         ("install", [tool, version]) => manager.install(tool.parse()?, version)?,
         ("install", [tool]) => manager.install_latest(tool.parse()?)?,
+        ("add-local", [tool, name, directory]) => {
+            manager.add_local(tool.parse()?, name, &PathBuf::from(directory))?
+        }
+        ("remove-local", [tool, name]) => manager.remove_local(tool.parse()?, name)?,
         ("uninstall", [tool, version]) | ("remove", [tool, version]) => {
             manager.uninstall(tool.parse()?, version)?
         }

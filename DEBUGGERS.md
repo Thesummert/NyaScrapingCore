@@ -6,7 +6,9 @@
 list [openocd|pyocd|probe-rs]   列出已安装版本及 PATH 中的程序
 install <工具> [版本]            安装指定版本；省略版本时安装最新版
 uninstall <工具> <版本>          删除本工具管理的指定版本（也可用 remove）
-use <工具> <版本|system>         保存选择；system 选择 PATH 中的第一个程序
+add-local <工具> <名称> <目录>   注册已有的本地调试工具
+remove-local <工具> <名称>       移除本地注册，不删除原文件
+use <工具> <版本|system|local:名称> 保存选择；system 选择 PATH 中的第一个程序
 which <工具>                     输出当前选择的可执行文件路径
 paths                            显示配置文件及安装目录
 gdbserver <工具> --target <目标> [--interface <文件>] [--port <端口>] [--dry-run]
@@ -24,6 +26,8 @@ nsc install pyocd 0.36.0
 nsc install probe-rs 0.31.0
 nsc use openocd 0.12.0-7
 nsc use pyocd system
+nsc add-local openocd custom "/path/to/openocd"
+nsc use openocd local:custom
 nsc list
 nsc uninstall openocd 0.12.0-7
 nsc gdbserver openocd --interface interface/stlink.cfg --target target/stm32f4x.cfg
@@ -42,6 +46,8 @@ nsc debug probe-rs --target STM32F407VG --file build/app.elf
 省略版本时会查询对应软件源的最新稳定版，OpenOCD 选择包含当前平台二进制文件的最新 xPack 正式发布。下载和构建进度由 curl、pip 或 Cargo 显示，具体形式取决于工具和终端；probe-rs 从源码构建，Cargo 的进度包含编译阶段。
 
 `probers` 是 `probe-rs` 的别名。未设置选择时，`which` 使用 PATH 中的第一个匹配项；已选择的托管版本不存在时会报错。配置只影响本程序的解析，不会修改系统 PATH。`list` 检测 PATH 中所有同名程序并调用 `--version`；运行它们时请确保 PATH 中的程序可信。
+
+本地注册支持 `openocd`、`pyocd` 和 `probe-rs`。目录可以是可执行文件所在目录，或包含 `bin` / `Scripts` 子目录的安装目录；名称由英文字母、数字、`.`、`-` 和 `_` 组成。同一工具下名称不能重复。注册保存绝对路径，不复制文件；移动或删除原程序后需要重新注册。`list` 会标记丢失的本地程序。使用 `remove-local <工具> <名称>` 移除注册时，如果它正被选中，会清除选择并回退到 PATH；原目录及文件不会被删除。本地注册保存在配置文件旁的 `config.local.json` 中。
 
 卸载需要明确指定版本，只删除该版本的托管目录，其他版本及系统 PATH 中的程序不受影响。如果卸载的是当前选中版本，会清除该工具的选择，之后 `which` 将尝试使用 PATH 中的程序。
 

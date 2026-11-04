@@ -48,6 +48,104 @@ pub struct Manager {
     pub data_dir: PathBuf,
 }
 impl Manager {
+    fn local_path(&self) -> PathBuf {
+        self.config_path.with_extension("local.json")
+    }
+    fn local_entries(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
+        match fs::read(self.local_path()) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn save_local_entries(
+        &self,
+        entries: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        fs::create_dir_all(self.config_path.parent().ok_or("invalid config path")?)?;
+        fs::write(self.local_path(), serde_json::to_vec_pretty(entries)?)?;
+        Ok(())
+    }
+    /// Register an existing debugger directory without copying or modifying its files.
+    pub fn add_local(&self, tool: Tool, name: &str, directory: &Path) -> Result<()> {
+        validate_local_name(name)?;
+        if !directory.is_dir() {
+            return Err(format!("not a directory: {}", directory.display()).into());
+        }
+        let directory = fs::canonicalize(directory)?;
+        let names = if cfg!(windows) {
+            vec![
+                format!("{}.exe", tool.executable()),
+                format!("{}.cmd", tool.executable()),
+                format!("{}.bat", tool.executable()),
+            ]
+        } else {
+            vec![tool.executable().to_owned()]
+        };
+        let executable = [
+            directory.clone(),
+            directory.join("bin"),
+            directory.join("Scripts"),
+        ]
+        .iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "{tool} executable not found in {} or its bin/Scripts directory",
+                directory.display()
+            )
+        })?;
+        let executable = executable.to_str().ok_or("local path is not valid UTF-8")?;
+        let key = format!("{tool}:local:{name}");
+        let mut entries = self.local_entries()?;
+        if entries.contains_key(&key) {
+            return Err(format!("local {tool} {name} already exists").into());
+        }
+        entries.insert(key, executable.into());
+        self.save_local_entries(&entries)
+    }
+    pub fn local(&self, tool: Tool) -> Result<Vec<(String, PathBuf)>> {
+        let prefix = format!("{tool}:local:");
+        let mut found = Vec::new();
+        for (key, value) in self.local_entries()? {
+            if let Some(name) = key.strip_prefix(&prefix) {
+                let path = value
+                    .as_str()
+                    .ok_or("invalid local debugger path in config")?;
+                found.push((name.to_owned(), PathBuf::from(path)));
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(found)
+    }
+    /// Remove a registration, leaving the original files untouched.
+    pub fn remove_local(&self, tool: Tool, name: &str) -> Result<()> {
+        validate_local_name(name)?;
+        let mut entries = self.local_entries()?;
+        if entries.remove(&format!("{tool}:local:{name}")).is_none() {
+            return Err(format!("local {tool} {name} is not registered").into());
+        }
+        let selection = format!("local:{name}");
+        if self.selected(tool)?.as_deref() == Some(&selection) {
+            let content = fs::read_to_string(&self.config_path)?;
+            let key = format!("{tool}=");
+            let remaining = content
+                .lines()
+                .filter(|line| !line.starts_with(&key))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(
+                &self.config_path,
+                if remaining.is_empty() {
+                    String::new()
+                } else {
+                    format!("{remaining}\n")
+                },
+            )?;
+        }
+        self.save_local_entries(&entries)
+    }
     pub fn new() -> Result<Self> {
         let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
             .ok_or("cannot determine user home directory")?;
@@ -179,6 +277,17 @@ impl Manager {
             if self.system(tool).is_empty() {
                 return Err(format!("{tool} not found on PATH").into());
             }
+        } else if let Some(name) = version.strip_prefix("local:") {
+            validate_local_name(name)?;
+            let path = self
+                .local(tool)?
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, path)| path)
+                .ok_or_else(|| format!("local {tool} {name} is not registered"))?;
+            if !path.is_file() {
+                return Err(format!("local {tool} {name} is missing: {}", path.display()).into());
+            }
         } else {
             validate_version(version)?;
             if !self.executable(tool, version).is_file() {
@@ -206,6 +315,25 @@ impl Manager {
                 .into_iter()
                 .next()
                 .ok_or_else(|| format!("{tool} not found on PATH").into()),
+            Some(v) if v.starts_with("local:") => {
+                let name = &v[6..];
+                validate_local_name(name)?;
+                let path = self
+                    .local(tool)?
+                    .into_iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, path)| path)
+                    .ok_or_else(|| format!("local {tool} {name} is not registered"))?;
+                if path.is_file() {
+                    Ok(path)
+                } else {
+                    Err(format!(
+                        "selected local {tool} {name} is missing: {}",
+                        path.display()
+                    )
+                    .into())
+                }
+            }
             Some(v) => {
                 validate_version(v)?;
                 let path = self.executable(tool, v);
@@ -454,6 +582,17 @@ fn validate_version(version: &str) -> Result<()> {
     }
     Ok(())
 }
+fn validate_local_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 100
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err("invalid local name; use letters, digits, '.', '-' or '_'".into());
+    }
+    Ok(())
+}
 fn run(command: &mut Command) -> Result<()> {
     let status = command.status()?;
     if !status.success() {
@@ -497,6 +636,42 @@ mod tests {
     #[test]
     fn tool_alias() {
         assert_eq!("probers".parse::<Tool>().unwrap(), Tool::ProbeRs);
+    }
+    #[test]
+    fn local_registration_selection_and_removal() {
+        let root = std::env::temp_dir().join(format!("nya-local-test-{}", std::process::id()));
+        let manager = Manager {
+            config_path: root.join("config/config"),
+            data_dir: root.join("data"),
+        };
+        let dir = root.join("my debugger");
+        let executable = dir.join("bin").join(if cfg!(windows) {
+            "openocd.exe"
+        } else {
+            "openocd"
+        });
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "test").unwrap();
+        assert!(manager.add_local(Tool::PyOcd, "other", &dir).is_err());
+        assert!(manager.add_local(Tool::OpenOcd, "bad:name", &dir).is_err());
+        manager.add_local(Tool::OpenOcd, "custom", &dir).unwrap();
+        assert!(manager.add_local(Tool::OpenOcd, "custom", &dir).is_err());
+        manager.select(Tool::OpenOcd, "local:custom").unwrap();
+        assert_eq!(
+            manager.resolve(Tool::OpenOcd).unwrap(),
+            fs::canonicalize(&dir)
+                .unwrap()
+                .join("bin")
+                .join(executable.file_name().unwrap())
+        );
+        fs::remove_file(&executable).unwrap();
+        assert!(manager.resolve(Tool::OpenOcd).is_err());
+        fs::write(&executable, "test").unwrap();
+        manager.remove_local(Tool::OpenOcd, "custom").unwrap();
+        assert!(executable.exists());
+        assert_eq!(manager.selected(Tool::OpenOcd).unwrap(), None);
+        assert!(manager.local(Tool::OpenOcd).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn selection_persists_and_resolves() {
