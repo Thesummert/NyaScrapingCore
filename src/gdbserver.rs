@@ -6,7 +6,7 @@ use crate::{
 };
 use std::{
     io,
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
     thread,
@@ -21,7 +21,11 @@ pub struct GdbServer<'a> {
 }
 
 impl GdbServer<'static> {
-    pub fn new(tool: Tool, executable: impl Into<PathBuf>, options: GdbServerOptions) -> Result<Self> {
+    pub fn new(
+        tool: Tool,
+        executable: impl Into<PathBuf>,
+        options: GdbServerOptions,
+    ) -> Result<Self> {
         Self::with_backend(backend::backend(tool), executable, options)
     }
 
@@ -62,7 +66,8 @@ impl<'a> GdbServer<'a> {
 
     /// Build a command for inspection or caller-controlled stdio and execution.
     pub fn command(&self) -> Result<Command> {
-        self.backend.gdbserver_command(&self.executable, &self.options)
+        self.backend
+            .gdbserver_command(&self.executable, &self.options)
     }
 
     /// Start the server and wait for its TCP endpoint. On failure the child is reaped.
@@ -76,7 +81,7 @@ fn address(port: u16) -> SocketAddr {
 }
 
 /// Owns the server process. Dropping this handle terminates and reaps the child.
-/// Readiness means a TCP connection succeeded; it does not verify target hardware.
+/// Readiness means the local port is bound; it does not verify target hardware.
 /// The endpoint check cannot eliminate races with other processes binding the port.
 #[derive(Debug)]
 pub struct RunningGdbServer {
@@ -109,7 +114,9 @@ impl RunningGdbServer {
         let started = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait()? {
-                return Err(format!("GDB server exited before accepting connections: {status}").into());
+                return Err(
+                    format!("GDB server exited before accepting connections: {status}").into(),
+                );
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -119,8 +126,7 @@ impl RunningGdbServer {
                 )
                 .into());
             }
-            if TcpStream::connect_timeout(&self.address, remaining.min(Duration::from_millis(100)))
-                .is_ok()
+            if matches!(TcpListener::bind(self.address), Err(ref error) if error.kind() == io::ErrorKind::AddrInUse)
             {
                 // Do not report success for a process that exited during the probe.
                 if let Some(status) = self.child.try_wait()? {
@@ -174,6 +180,7 @@ impl Drop for RunningGdbServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     fn options(tool: Tool) -> GdbServerOptions {
         GdbServerOptions {
@@ -232,21 +239,39 @@ mod tests {
         if mode == "exit" {
             std::process::exit(7);
         }
-        let _listener = if mode == "listen" {
+        let _listener = if mode == "listen" || mode == "single" {
             Some(TcpListener::bind(std::env::var("NSC_TEST_SERVER_ADDRESS").unwrap()).unwrap())
         } else {
             None
         };
+        if mode == "single" {
+            let (mut stream, _) = _listener.unwrap().accept().unwrap();
+            use std::io::Write;
+            stream.write_all(b"first client").unwrap();
+            return;
+        }
         loop {
             thread::sleep(Duration::from_secs(1));
         }
     }
 
     #[test]
+    fn readiness_does_not_consume_the_first_client() {
+        use std::io::Read;
+        let port = unused_port();
+        let _server =
+            RunningGdbServer::start(helper("single", port), port, Duration::from_secs(5)).unwrap();
+        let mut stream = TcpStream::connect(address(port)).unwrap();
+        let mut message = String::new();
+        stream.read_to_string(&mut message).unwrap();
+        assert_eq!(message, "first client");
+    }
+
+    #[test]
     fn starts_queries_and_stops_a_server() {
         let port = unused_port();
-        let mut server = RunningGdbServer::start(helper("listen", port), port, Duration::from_secs(5))
-                .unwrap();
+        let mut server =
+            RunningGdbServer::start(helper("listen", port), port, Duration::from_secs(5)).unwrap();
         assert_eq!(server.address(), address(port));
         assert!(server.id() > 0);
         assert!(server.try_wait().unwrap().is_none());
@@ -258,8 +283,8 @@ mod tests {
     #[test]
     fn drop_reaps_the_child() {
         let port = unused_port();
-        let server = RunningGdbServer::start(helper("listen", port), port, Duration::from_secs(5))
-                .unwrap();
+        let server =
+            RunningGdbServer::start(helper("listen", port), port, Duration::from_secs(5)).unwrap();
         drop(server);
         // Once Drop returns, the listener owned by the child has been closed.
         assert!(TcpStream::connect_timeout(&address(port), Duration::from_millis(100)).is_err());
@@ -282,10 +307,11 @@ mod tests {
     #[test]
     fn reports_early_exit_and_startup_timeout() {
         let port = unused_port();
-        let error =
-            RunningGdbServer::start(helper("exit", port), port, Duration::from_secs(5))
-                .unwrap_err();
-        assert!(error.to_string().contains("exited before accepting connections"));
+        let error = RunningGdbServer::start(helper("exit", port), port, Duration::from_secs(5))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exited before accepting connections"));
         let port = unused_port();
         let error =
             RunningGdbServer::start(helper("sleep", port), port, Duration::from_millis(100))
@@ -296,12 +322,10 @@ mod tests {
     #[test]
     fn rejects_invalid_start_parameters() {
         let error =
-            RunningGdbServer::start(Command::new("unused"), 0, Duration::from_secs(1))
-                .unwrap_err();
+            RunningGdbServer::start(Command::new("unused"), 0, Duration::from_secs(1)).unwrap_err();
         assert!(error.to_string().contains("port"));
         let error =
-            RunningGdbServer::start(Command::new("unused"), 3333, Duration::ZERO)
-                .unwrap_err();
+            RunningGdbServer::start(Command::new("unused"), 3333, Duration::ZERO).unwrap_err();
         assert!(error.to_string().contains("timeout"));
     }
 }
