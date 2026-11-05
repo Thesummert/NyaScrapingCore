@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -407,6 +409,9 @@ impl Manager {
         Ok(())
     }
     pub fn install_latest(&self, tool: Tool) -> Result<()> {
+        self.install_latest_cancellable(tool, &AtomicBool::new(false))
+    }
+    pub fn install_latest_cancellable(&self, tool: Tool, cancel: &AtomicBool) -> Result<()> {
         eprintln!("Looking up latest {tool} release...");
         let url = match tool {
             Tool::OpenOcd => {
@@ -415,7 +420,8 @@ impl Manager {
             Tool::PyOcd => "https://pypi.org/pypi/pyocd/json",
             Tool::ProbeRs => "https://crates.io/api/v1/crates/probe-rs-tools",
         };
-        let output = Command::new("curl")
+        let mut command = Command::new("curl");
+        command
             .args([
                 "--fail",
                 "--silent",
@@ -428,15 +434,10 @@ impl Manager {
                 "nsc/0.1",
                 url,
             ])
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "failed to query latest {tool} release: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            .stdout(std::process::Stdio::piped());
+        // Drain the response concurrently so a large release list cannot fill the pipe.
+        let output = run_capture(&mut command, cancel)?;
+        let metadata: serde_json::Value = serde_json::from_slice(&output)?;
         let platform = if tool == Tool::OpenOcd {
             Some(openocd_platform()?)
         } else {
@@ -444,9 +445,18 @@ impl Manager {
         };
         let version = latest_version(tool, &metadata, platform)?;
         eprintln!("Latest {tool}: {version}");
-        self.install(tool, &version)
+        self.install_cancellable(tool, &version, cancel)
     }
     pub fn install(&self, tool: Tool, version: &str) -> Result<()> {
+        self.install_cancellable(tool, version, &AtomicBool::new(false))
+    }
+    pub fn install_cancellable(
+        &self,
+        tool: Tool,
+        version: &str,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        check_cancel(cancel)?;
         validate_version(version)?;
         let root = self.data_dir.join(tool.to_string()).join(version);
         if root.exists() {
@@ -459,61 +469,77 @@ impl Manager {
             match tool {
                 Tool::PyOcd => {
                     let python = if cfg!(windows) { "python" } else { "python3" };
-                    run(Command::new(python).arg("-m").arg("venv").arg(&root))?;
+                    run_cancellable(
+                        Command::new(python).arg("-m").arg("venv").arg(&root),
+                        cancel,
+                    )?;
                     let interpreter = if cfg!(windows) {
                         root.join("Scripts/python.exe")
                     } else {
                         root.join("bin/python")
                     };
-                    run(Command::new(interpreter).args([
-                        "-m",
-                        "pip",
-                        "install",
-                        "--progress-bar",
-                        "on",
-                        &format!("pyocd=={version}"),
-                    ]))?;
+                    run_cancellable(
+                        Command::new(interpreter).args([
+                            "-m",
+                            "pip",
+                            "install",
+                            "--progress-bar",
+                            "on",
+                            &format!("pyocd=={version}"),
+                        ]),
+                        cancel,
+                    )?;
                 }
                 Tool::ProbeRs => {
-                    run(Command::new("cargo")
-                        .env("CARGO_TERM_PROGRESS_WHEN", "always")
-                        // Cargo requires an explicit width when progress is forced.
-                        .env("CARGO_TERM_PROGRESS_WIDTH", "80")
-                        .args([
-                            "install",
-                            "probe-rs-tools",
-                            "--locked",
-                            "--version",
-                            &format!("={version}"),
-                            "--root",
-                        ])
-                        .arg(&root))?;
+                    run_cancellable(
+                        Command::new("cargo")
+                            .env("CARGO_TERM_PROGRESS_WHEN", "always")
+                            // Cargo requires an explicit width when progress is forced.
+                            .env("CARGO_TERM_PROGRESS_WIDTH", "80")
+                            .args([
+                                "install",
+                                "probe-rs-tools",
+                                "--locked",
+                                "--version",
+                                &format!("={version}"),
+                                "--root",
+                            ])
+                            .arg(&root),
+                        cancel,
+                    )?;
                 }
                 Tool::OpenOcd => {
                     let platform = openocd_platform()?;
                     fs::create_dir_all(&root)?;
                     let archive = root.join("download.archive");
                     let url = format!("https://github.com/xpack-dev-tools/openocd-xpack/releases/download/v{version}/xpack-openocd-{version}-{platform}");
-                    run(Command::new("curl")
-                        .args([
-                            "--fail",
-                            "--progress-bar",
-                            "--location",
-                            "--proto",
-                            "=https",
-                            "--tlsv1.2",
-                            "--output",
-                        ])
-                        .arg(&archive)
-                        .arg(url))?;
-                    run(Command::new("tar")
-                        .arg("-xf")
-                        .arg(&archive)
-                        .arg("-C")
-                        .arg(&root))?;
+                    run_cancellable(
+                        Command::new("curl")
+                            .args([
+                                "--fail",
+                                "--progress-bar",
+                                "--location",
+                                "--proto",
+                                "=https",
+                                "--tlsv1.2",
+                                "--output",
+                            ])
+                            .arg(&archive)
+                            .arg(url),
+                        cancel,
+                    )?;
+                    run_cancellable(
+                        Command::new("tar")
+                            .arg("-xf")
+                            .arg(&archive)
+                            .arg("-C")
+                            .arg(&root),
+                        cancel,
+                    )?;
                     fs::remove_file(archive)?;
                 }
             }
+            check_cancel(cancel)?;
             if !self.executable(tool, version).is_file() {
                 return Err("installation did not produce the expected executable".into());
             }
@@ -593,17 +619,109 @@ fn validate_local_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
-fn run(command: &mut Command) -> Result<()> {
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("{command:?} failed: {status}").into());
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) {
+        Err("安装已取消".into())
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+fn spawn_install(command: &mut Command, cancel: &AtomicBool) -> Result<std::process::Child> {
+    check_cancel(cancel)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Ok(command.spawn()?)
+}
+
+fn wait_install(child: &mut std::process::Child, cancel: &AtomicBool) -> Result<()> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", child.id())])
+                    .status();
+            }
+            #[cfg(windows)]
+            {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &child.id().to_string()])
+                    .status();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("安装已取消".into());
+        }
+        if let Some(status) = child.try_wait()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("安装命令失败：{status}").into())
+            };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn run_cancellable(command: &mut Command, cancel: &AtomicBool) -> Result<()> {
+    let mut child = spawn_install(command, cancel)?;
+    wait_install(&mut child, cancel)
+}
+
+fn run_capture(command: &mut Command, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut child = spawn_install(command, cancel)?;
+    let mut stdout = child.stdout.take().ok_or("无法读取安装命令输出")?;
+    let reader = std::thread::spawn(move || {
+        let mut data = Vec::new();
+        stdout.read_to_end(&mut data).map(|_| data)
+    });
+    let result = wait_install(&mut child, cancel);
+    let output = reader.join().map_err(|_| "无法读取安装命令输出")??;
+    result?;
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_install_process_group() {
+        use std::sync::Arc;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            run_cancellable(
+                Command::new("sh").args(["-c", "sleep 30 & wait"]),
+                &worker_cancel,
+            )
+            .map_err(|e| e.to_string())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        cancel.store(true, Ordering::SeqCst);
+        assert!(worker.join().unwrap().unwrap_err().contains("安装已取消"));
+    }
+
+    #[test]
+    fn cancelled_install_does_not_create_directory() {
+        let root = std::env::temp_dir().join(format!("nsc-cancel-test-{}", std::process::id()));
+        let manager = Manager {
+            config_path: root.join("config"),
+            data_dir: root.join("data"),
+        };
+        let cancel = AtomicBool::new(true);
+        assert!(manager
+            .install_cancellable(Tool::PyOcd, "1.0", &cancel)
+            .is_err());
+        assert!(!root.exists());
+    }
+
     #[test]
     fn latest_versions_use_stable_registry_metadata() {
         let py = serde_json::json!({"info": {"version": "0.40.0"}});
