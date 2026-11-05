@@ -6,11 +6,35 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+/// Most recent installation stage and, when available, actual download measurements.
+#[derive(Clone, Debug, Default)]
+pub struct InstallProgress {
+    pub stage: String,
+    pub percent: Option<f32>,
+    pub downloaded: Option<u64>,
+    pub total: Option<u64>,
+    pub bytes_per_second: Option<u64>,
+    pub remaining_seconds: Option<u64>,
+}
+pub type SharedInstallProgress = Arc<Mutex<InstallProgress>>;
+
+fn stage(progress: &SharedInstallProgress, message: &str) {
+    if let Ok(mut value) = progress.lock() {
+        *value = InstallProgress {
+            stage: message.into(),
+            ..Default::default()
+        };
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
@@ -412,6 +436,15 @@ impl Manager {
         self.install_latest_cancellable(tool, &AtomicBool::new(false))
     }
     pub fn install_latest_cancellable(&self, tool: Tool, cancel: &AtomicBool) -> Result<()> {
+        self.install_latest_with_progress(tool, cancel, &Default::default())
+    }
+    pub fn install_latest_with_progress(
+        &self,
+        tool: Tool,
+        cancel: &AtomicBool,
+        progress: &SharedInstallProgress,
+    ) -> Result<()> {
+        stage(progress, "正在查询最新版本…");
         eprintln!("Looking up latest {tool} release...");
         let url = match tool {
             Tool::OpenOcd => {
@@ -445,7 +478,7 @@ impl Manager {
         };
         let version = latest_version(tool, &metadata, platform)?;
         eprintln!("Latest {tool}: {version}");
-        self.install_cancellable(tool, &version, cancel)
+        self.install_with_progress(tool, &version, cancel, progress)
     }
     pub fn install(&self, tool: Tool, version: &str) -> Result<()> {
         self.install_cancellable(tool, version, &AtomicBool::new(false))
@@ -455,6 +488,15 @@ impl Manager {
         tool: Tool,
         version: &str,
         cancel: &AtomicBool,
+    ) -> Result<()> {
+        self.install_with_progress(tool, version, cancel, &Default::default())
+    }
+    pub fn install_with_progress(
+        &self,
+        tool: Tool,
+        version: &str,
+        cancel: &AtomicBool,
+        progress: &SharedInstallProgress,
     ) -> Result<()> {
         check_cancel(cancel)?;
         validate_version(version)?;
@@ -468,6 +510,7 @@ impl Manager {
         let result = (|| -> Result<()> {
             match tool {
                 Tool::PyOcd => {
+                    stage(progress, "正在创建 Python 环境…");
                     let python = if cfg!(windows) { "python" } else { "python3" };
                     run_cancellable(
                         Command::new(python).arg("-m").arg("venv").arg(&root),
@@ -478,21 +521,34 @@ impl Manager {
                     } else {
                         root.join("bin/python")
                     };
-                    run_cancellable(
+                    stage(progress, "正在准备下载 Python 依赖…");
+                    let help = run_capture(
+                        Command::new(&interpreter)
+                            .args(["-m", "pip", "install", "--help"])
+                            .stdout(std::process::Stdio::piped()),
+                        cancel,
+                    )?;
+                    let raw = String::from_utf8_lossy(&help).contains("on, off, raw");
+                    run_monitored(
                         Command::new(interpreter).args([
+                            "-u",
                             "-m",
                             "pip",
                             "install",
                             "--progress-bar",
-                            "on",
+                            if raw { "raw" } else { "on" },
                             &format!("pyocd=={version}"),
                         ]),
                         cancel,
+                        progress,
+                        MonitorKind::Pip,
                     )?;
                 }
                 Tool::ProbeRs => {
-                    run_cancellable(
+                    stage(progress, "正在准备下载 Rust 依赖…");
+                    run_monitored(
                         Command::new("cargo")
+                            .env("CARGO_TERM_COLOR", "never")
                             .env("CARGO_TERM_PROGRESS_WHEN", "always")
                             // Cargo requires an explicit width when progress is forced.
                             .env("CARGO_TERM_PROGRESS_WIDTH", "80")
@@ -506,6 +562,8 @@ impl Manager {
                             ])
                             .arg(&root),
                         cancel,
+                        progress,
+                        MonitorKind::Cargo,
                     )?;
                 }
                 Tool::OpenOcd => {
@@ -513,11 +571,11 @@ impl Manager {
                     fs::create_dir_all(&root)?;
                     let archive = root.join("download.archive");
                     let url = format!("https://github.com/xpack-dev-tools/openocd-xpack/releases/download/v{version}/xpack-openocd-{version}-{platform}");
-                    run_cancellable(
+                    stage(progress, "正在下载 OpenOCD…");
+                    run_download(
                         Command::new("curl")
                             .args([
                                 "--fail",
-                                "--progress-bar",
                                 "--location",
                                 "--proto",
                                 "=https",
@@ -527,7 +585,9 @@ impl Manager {
                             .arg(&archive)
                             .arg(url),
                         cancel,
+                        progress,
                     )?;
+                    stage(progress, "下载完成，正在解压…");
                     run_cancellable(
                         Command::new("tar")
                             .arg("-xf")
@@ -672,6 +732,311 @@ fn run_cancellable(command: &mut Command, cancel: &AtomicBool) -> Result<()> {
     wait_install(&mut child, cancel)
 }
 
+#[derive(Clone, Copy)]
+enum MonitorKind {
+    Pip,
+    Cargo,
+}
+
+struct ProgressMonitor {
+    kind: MonitorKind,
+    started: Instant,
+    first_bytes: u64,
+    last_bytes: u64,
+    last_total: u64,
+    downloads: usize,
+    building: bool,
+    build_sample: Option<(Instant, u64)>,
+}
+
+impl ProgressMonitor {
+    fn new(kind: MonitorKind) -> Self {
+        Self {
+            kind,
+            started: Instant::now(),
+            first_bytes: 0,
+            last_bytes: 0,
+            last_total: 0,
+            downloads: 0,
+            building: false,
+            build_sample: None,
+        }
+    }
+    fn update(&mut self, line: &str) -> Option<InstallProgress> {
+        let line = line.trim();
+        match self.kind {
+            MonitorKind::Pip => {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if let ["Progress", current, "of", total] = fields.as_slice() {
+                    let current: u64 = current.parse().ok()?;
+                    let total: u64 = total.parse().ok()?;
+                    if current < self.last_bytes || total != self.last_total {
+                        self.started = Instant::now();
+                        self.first_bytes = current;
+                    }
+                    self.last_bytes = current;
+                    self.last_total = total;
+                    let elapsed = self.started.elapsed().as_secs_f64();
+                    let speed = if elapsed >= 0.2 && current > self.first_bytes {
+                        Some(((current - self.first_bytes) as f64 / elapsed) as u64)
+                    } else {
+                        None
+                    };
+                    let remaining = speed.filter(|speed| *speed > 0).and_then(|speed| {
+                        if total > 0 && current <= total {
+                            Some((total - current) / speed)
+                        } else {
+                            None
+                        }
+                    });
+                    return Some(InstallProgress {
+                        stage: "正在下载 Python 依赖（当前文件）…".into(),
+                        percent: if total > 0 {
+                            Some((current as f64 / total as f64 * 100.0).min(100.0) as f32)
+                        } else {
+                            None
+                        },
+                        downloaded: Some(current),
+                        total: if total > 0 { Some(total) } else { None },
+                        bytes_per_second: speed,
+                        remaining_seconds: remaining,
+                    });
+                }
+                if line.starts_with("Downloading ") || line.starts_with("Using cached ") {
+                    self.last_bytes = 0;
+                    self.last_total = 0;
+                    return Some(InstallProgress {
+                        stage: "正在获取 Python 依赖（当前文件）…".into(),
+                        ..Default::default()
+                    });
+                }
+                if line.starts_with("Installing collected packages:")
+                    || line.starts_with("Building wheels for collected packages:")
+                {
+                    return Some(InstallProgress {
+                        stage: "正在构建或安装 Python 依赖…".into(),
+                        ..Default::default()
+                    });
+                }
+            }
+            MonitorKind::Cargo => {
+                if line.starts_with("Downloaded ") {
+                    self.downloads += 1;
+                    return Some(InstallProgress {
+                        stage: format!("正在下载 Rust 依赖（已下载 {} 个包）…", self.downloads),
+                        ..Default::default()
+                    });
+                }
+                if line.starts_with("Downloading ") {
+                    return Some(InstallProgress {
+                        stage: format!("正在下载 Rust 依赖（已下载 {} 个包）…", self.downloads),
+                        ..Default::default()
+                    });
+                }
+                if let Some(rest) = line.strip_prefix("Building ") {
+                    self.building = true;
+                    if let Some((_, tail)) = rest.split_once(']') {
+                        if let Some((done, total)) = tail
+                            .split_whitespace()
+                            .next()
+                            .and_then(|part| part.split_once('/'))
+                        {
+                            if let (Ok(done), Ok(total)) = (
+                                done.parse::<u64>(),
+                                total.trim_end_matches(':').parse::<u64>(),
+                            ) {
+                                if total > 0 {
+                                    let (start, initial) =
+                                        *self.build_sample.get_or_insert((Instant::now(), done));
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    let completed = done.saturating_sub(initial);
+                                    let remaining_seconds =
+                                        if completed > 0 && elapsed >= 1.0 && done <= total {
+                                            Some(
+                                                ((total - done) as f64 * elapsed / completed as f64)
+                                                    as u64,
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                    return Some(InstallProgress {
+                                        stage: format!(
+                                            "正在编译 Rust 依赖（{done}/{total} 个任务）…"
+                                        ),
+                                        percent: Some(
+                                            (done as f64 / total as f64 * 100.0).min(100.0) as f32,
+                                        ),
+                                        remaining_seconds,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if line.starts_with("Compiling ") && !self.building {
+                    self.building = true;
+                    return Some(InstallProgress {
+                        stage: "正在编译 Rust 依赖…".into(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+fn run_monitored(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    progress: &SharedInstallProgress,
+    kind: MonitorKind,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    match kind {
+        MonitorKind::Pip => {
+            command.stdout(std::process::Stdio::piped());
+        }
+        MonitorKind::Cargo => {
+            command.stderr(std::process::Stdio::piped());
+        }
+    }
+    let mut child = spawn_install(command, cancel)?;
+    let mut stream: Box<dyn Read + Send> = match kind {
+        MonitorKind::Pip => Box::new(child.stdout.take().ok_or("无法读取 pip 输出")?),
+        MonitorKind::Cargo => Box::new(child.stderr.take().ok_or("无法读取 Cargo 输出")?),
+    };
+    let shared = progress.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        let mut line = Vec::new();
+        let mut monitor = ProgressMonitor::new(kind);
+        loop {
+            let count = match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            match kind {
+                MonitorKind::Pip => {
+                    let _ = std::io::stdout().write_all(&buffer[..count]);
+                }
+                MonitorKind::Cargo => {
+                    let _ = std::io::stderr().write_all(&buffer[..count]);
+                }
+            }
+            for byte in &buffer[..count] {
+                if *byte == b'\r' || *byte == b'\n' {
+                    let text = String::from_utf8_lossy(&line);
+                    // Cargo prefixes terminal updates with an ANSI erase-line sequence.
+                    let text = text
+                        .trim_start()
+                        .trim_start_matches("\x1b[K")
+                        .trim_start_matches("\x1b[2K");
+                    if let Some(value) = monitor.update(text) {
+                        if let Ok(mut current) = shared.lock() {
+                            *current = value;
+                        }
+                    }
+                    line.clear();
+                } else if line.len() < 8192 {
+                    line.push(*byte);
+                }
+            }
+        }
+    });
+    let result = wait_install(&mut child, cancel);
+    let _ = reader.join();
+    result
+}
+
+fn parse_size(value: &str) -> Option<u64> {
+    let (number, multiplier) = match value.chars().last()? {
+        'k' | 'K' => (&value[..value.len() - 1], 1024_f64),
+        'M' => (&value[..value.len() - 1], 1024_f64.powi(2)),
+        'G' => (&value[..value.len() - 1], 1024_f64.powi(3)),
+        'T' => (&value[..value.len() - 1], 1024_f64.powi(4)),
+        _ => (value, 1.0),
+    };
+    let number = number.parse::<f64>().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    Some((number * multiplier) as u64)
+}
+
+fn parse_remaining(value: &str) -> Option<u64> {
+    let parts = value
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    match parts.as_slice() {
+        [h, m, s] if *m < 60 && *s < 60 => Some(h * 3600 + m * 60 + s),
+        _ => None,
+    }
+}
+
+fn parse_curl_progress(line: &str) -> Option<InstallProgress> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != 12 {
+        return None;
+    }
+    let percent = fields[2].parse::<f32>().ok()?;
+    let total = parse_size(fields[1])?;
+    let downloaded = parse_size(fields[3])?;
+    Some(InstallProgress {
+        stage: "正在下载 OpenOCD…".into(),
+        percent: if total > 0 {
+            Some(percent.clamp(0.0, 100.0))
+        } else {
+            None
+        },
+        downloaded: Some(downloaded),
+        total: if total > 0 { Some(total) } else { None },
+        bytes_per_second: parse_size(fields[11]),
+        remaining_seconds: parse_remaining(fields[10]),
+    })
+}
+
+fn run_download(
+    command: &mut Command,
+    cancel: &AtomicBool,
+    progress: &SharedInstallProgress,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    command.stderr(std::process::Stdio::piped());
+    let mut child = spawn_install(command, cancel)?;
+    let mut stderr = child.stderr.take().ok_or("无法读取下载进度")?;
+    let shared = progress.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        let mut line = Vec::new();
+        loop {
+            let count = match stderr.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let _ = std::io::stderr().write_all(&buffer[..count]);
+            for byte in &buffer[..count] {
+                if *byte == b'\r' || *byte == b'\n' {
+                    if let Some(value) = parse_curl_progress(&String::from_utf8_lossy(&line)) {
+                        if let Ok(mut current) = shared.lock() {
+                            *current = value;
+                        }
+                    }
+                    line.clear();
+                } else if line.len() < 8192 {
+                    line.push(*byte);
+                }
+            }
+        }
+    });
+    let result = wait_install(&mut child, cancel);
+    let _ = reader.join();
+    result
+}
+
 fn run_capture(command: &mut Command, cancel: &AtomicBool) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut child = spawn_install(command, cancel)?;
@@ -689,6 +1054,68 @@ fn run_capture(command: &mut Command, cancel: &AtomicBool) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pip_reports_each_download_and_resets_measurements() {
+        let mut monitor = ProgressMonitor::new(MonitorKind::Pip);
+        monitor.update("  Downloading example.whl").unwrap();
+        let first = monitor.update("Progress 100 of 1000").unwrap();
+        assert_eq!(first.percent, Some(10.0));
+        monitor.started = Instant::now() - Duration::from_secs(2);
+        let next = monitor.update("Progress 500 of 1000").unwrap();
+        assert!((198..=200).contains(&next.bytes_per_second.unwrap()));
+        assert_eq!(next.remaining_seconds, Some(2));
+        monitor.update("  Downloading another.whl").unwrap();
+        let next_file = monitor.update("Progress 50 of 500").unwrap();
+        assert_eq!(next_file.percent, Some(10.0));
+        assert_eq!(next_file.bytes_per_second, None);
+        let installing = monitor
+            .update("Installing collected packages: pyocd")
+            .unwrap();
+        assert_eq!(installing.percent, None);
+    }
+
+    #[test]
+    fn cargo_reports_download_count_and_build_progress() {
+        let mut monitor = ProgressMonitor::new(MonitorKind::Cargo);
+        assert!(monitor
+            .update("  Downloaded foo v1.0.0")
+            .unwrap()
+            .stage
+            .contains("1 个包"));
+        assert!(monitor
+            .update("  Downloaded bar v2.0.0")
+            .unwrap()
+            .stage
+            .contains("2 个包"));
+        let build = monitor
+            .update("    Building [====>    ] 12/48: foo")
+            .unwrap();
+        assert_eq!(build.percent, Some(25.0));
+        assert!(build.stage.contains("12/48"));
+        assert!(monitor.update("   Compiling foo v1.0.0").is_none());
+        assert!(monitor.update("network warning").is_none());
+    }
+
+    #[test]
+    fn curl_progress_reports_download_and_unknown_totals() {
+        let progress = parse_curl_progress(
+            " 25  100M   25 25.0M    0     0  2500k      0  0:00:40  0:00:10  0:00:30 2600k",
+        )
+        .unwrap();
+        assert_eq!(progress.percent, Some(25.0));
+        assert_eq!(progress.downloaded, Some(25 * 1024 * 1024));
+        assert_eq!(progress.total, Some(100 * 1024 * 1024));
+        assert_eq!(progress.bytes_per_second, Some(2600 * 1024));
+        assert_eq!(progress.remaining_seconds, Some(30));
+        let unknown = parse_curl_progress(
+            "  0     0    0  123k    0     0  1200k      0 --:--:--  0:00:01 --:--:-- 1200k",
+        )
+        .unwrap();
+        assert_eq!(unknown.percent, None);
+        assert_eq!(unknown.remaining_seconds, None);
+        assert!(parse_curl_progress("curl: network error").is_none());
+    }
 
     #[cfg(unix)]
     #[test]
