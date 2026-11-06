@@ -40,6 +40,8 @@ pub fn backend(tool: Tool) -> &'static dyn DebugBackend {
 pub struct GdbServerOptions {
     pub target: String,
     pub interface: Option<String>,
+    /// OpenOCD transport override, selected after the probe and before the target.
+    pub transport: Option<String>,
     pub port: u16,
 }
 
@@ -50,6 +52,14 @@ impl GdbServerOptions {
         }
         if self.port == 0 {
             return Err("GDB port must be between 1 and 65535".into());
+        }
+        if let Some(transport) = &self.transport {
+            if tool != Tool::OpenOcd {
+                return Err("--transport is only supported by OpenOCD".into());
+            }
+            if !matches!(transport.as_str(), "swd" | "jtag" | "hla_swd" | "hla_jtag") {
+                return Err("invalid OpenOCD transport; use swd, jtag, hla_swd or hla_jtag".into());
+            }
         }
         match (tool, self.interface.as_deref()) {
             (Tool::OpenOcd, Some(value)) if !value.trim().is_empty() && !value.starts_with('-') => {
@@ -118,6 +128,7 @@ mod tests {
             let options = GdbServerOptions {
                 target: "chip".into(),
                 interface: (tool == Tool::OpenOcd).then(|| "interface.cfg".into()),
+                transport: None,
                 port: 3333,
             };
             let invalid_erase = Operation::Erase {
@@ -138,6 +149,7 @@ mod tests {
         let mut options = GdbServerOptions {
             target: "target/stm32f4x.cfg".into(),
             interface: Some("interface/stlink.cfg".into()),
+            transport: None,
             port: 4444,
         };
         let command = gdbserver_command(Tool::OpenOcd, exe, &options).unwrap();
@@ -188,6 +200,7 @@ mod tests {
         let mut options = GdbServerOptions {
             target: "chip".into(),
             interface: None,
+            transport: None,
             port: 3333,
         };
         assert!(gdbserver_command(Tool::OpenOcd, exe, &options).is_err());
@@ -199,11 +212,73 @@ mod tests {
     }
 
     #[test]
+    fn jlink_transport_is_selected_before_target_for_connections_and_maintenance() {
+        let exe = Path::new("openocd");
+        let mut options = GdbServerOptions {
+            target: "target/stm32h7x.cfg".into(),
+            interface: Some("interface/jlink.cfg".into()),
+            transport: None,
+            port: 3333,
+        };
+        for interface in [
+            "interface/jlink.cfg",
+            "/opt/openocd/scripts/interface/jlink.cfg",
+            "C:\\OpenOCD\\scripts\\interface\\jlink.cfg",
+        ] {
+            options.interface = Some(interface.into());
+            for transport in [None, Some("jtag")] {
+                options.transport = transport.map(str::to_owned);
+                let commands = [
+                    gdbserver_command(Tool::OpenOcd, exe, &options).unwrap(),
+                    operation_command(Tool::OpenOcd, exe, &options, &Operation::Reset).unwrap(),
+                    operation_command(
+                        Tool::OpenOcd,
+                        exe,
+                        &options,
+                        &Operation::Flash("Cargo.toml".into()),
+                    )
+                    .unwrap(),
+                ];
+                for command in commands {
+                    let args: Vec<_> = command.get_args().map(|v| v.to_str().unwrap()).collect();
+                    assert_eq!(
+                        &args[..6],
+                        [
+                            "-f",
+                            interface,
+                            "-c",
+                            &format!("transport select {}", transport.unwrap_or("swd")),
+                            "-f",
+                            "target/stm32h7x.cfg",
+                        ]
+                    );
+                }
+            }
+        }
+        options.interface = Some("/custom/jlink.cfg".into());
+        options.transport = None;
+        let command = gdbserver_command(Tool::OpenOcd, exe, &options).unwrap();
+        assert!(!command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().contains("transport select")));
+        for transport in ["swd; shutdown", "", "unknown"] {
+            options.transport = Some(transport.into());
+            assert!(gdbserver_command(Tool::OpenOcd, exe, &options).is_err());
+        }
+        options.interface = None;
+        options.transport = Some("swd".into());
+        for tool in [Tool::PyOcd, Tool::ProbeRs] {
+            assert!(gdbserver_command(tool, exe, &options).is_err());
+        }
+    }
+
+    #[test]
     fn builds_maintenance_commands() {
         let exe = Path::new("debugger");
         let mut options = GdbServerOptions {
             target: "target/stm32f4x.cfg".into(),
             interface: Some("interface/stlink.cfg".into()),
+            transport: None,
             port: 3333,
         };
         let reset = operation_command(Tool::OpenOcd, exe, &options, &Operation::Reset).unwrap();

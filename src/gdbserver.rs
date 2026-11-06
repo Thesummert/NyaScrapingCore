@@ -186,6 +186,7 @@ mod tests {
         GdbServerOptions {
             target: "chip or target config".into(),
             interface: (tool == Tool::OpenOcd).then(|| "interface config".into()),
+            transport: None,
             port: 3333,
         }
     }

@@ -97,3 +97,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 端口检查和子进程绑定之间仍存在竞争窗口。服务句柄支持 `id`、`address`、`try_wait`、
 `wait` 和可重复调用的 `stop`；句柄离开作用域时终止并回收直接子进程。
 `session::run` 已复用此生命周期实现，GDB 客户端退出或启动失败时会清理服务。
+
+## OpenOCD J-Link 传输方式
+
+内置 `interface/jlink.cfg` 在连接、烧录、擦除和复位时默认使用 SWD。
+仅支持 SWD 的 J-Link OB 探针会拒绝 OpenOCD 自动选择的 JTAG。
+使用 JTAG 接线时可显式指定：
+
+```sh
+nsc gdbserver openocd --interface interface/jlink.cfg --transport jtag --target target/stm32h7x.cfg
+```
+
+`--transport` 仅用于 OpenOCD，可选 `swd`、`jtag`、`hla_swd`、`hla_jtag`。
+传输方式在加载 Probe 配置后、加载目标配置前设置。
+自定义 Probe 配置保留自己的默认方式，也可以通过该选项覆盖。

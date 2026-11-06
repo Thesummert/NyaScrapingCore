@@ -1,20 +1,37 @@
 use super::{GdbServerOptions, Operation, Result};
 use std::{path::Path, process::Command};
 
-pub fn gdbserver_command(executable: &Path, options: &GdbServerOptions) -> Command {
+fn configured_command(executable: &Path, options: &GdbServerOptions) -> Command {
     let mut command = Command::new(executable);
+    command.arg("-f").arg(
+        options
+            .interface
+            .as_deref()
+            .expect("validated OpenOCD interface"),
+    );
+    // OpenOCD otherwise auto-selects JTAG, which SWD-only J-Link OB probes reject.
+    // Leave custom scripts in control and allow an explicit JTAG override.
+    let interface = options
+        .interface
+        .as_deref()
+        .unwrap_or("")
+        .replace('\\', "/");
+    let transport = options.transport.as_deref().or_else(|| {
+        (interface == "interface/jlink.cfg" || interface.ends_with("/interface/jlink.cfg"))
+            .then_some("swd")
+    });
+    if let Some(transport) = transport {
+        command
+            .arg("-c")
+            .arg(format!("transport select {transport}"));
+    }
+    command.arg("-f").arg(&options.target);
     command
-        .arg("-f")
-        .arg(
-            options
-                .interface
-                .as_deref()
-                .expect("validated OpenOCD interface"),
-        )
-        .arg("-f")
-        .arg(&options.target)
-        .arg("-c")
-        .arg(format!("gdb_port {}", options.port));
+}
+
+pub fn gdbserver_command(executable: &Path, options: &GdbServerOptions) -> Command {
+    let mut command = configured_command(executable, options);
+    command.arg("-c").arg(format!("gdb_port {}", options.port));
     command
 }
 
@@ -23,12 +40,7 @@ pub fn operation_command(
     options: &GdbServerOptions,
     operation: &Operation,
 ) -> Result<Command> {
-    let mut command = Command::new(executable);
-    command
-        .arg("-f")
-        .arg(options.interface.as_deref().expect("validated interface"))
-        .arg("-f")
-        .arg(&options.target);
+    let mut command = configured_command(executable, options);
     let script = match operation {
         Operation::Flash(path) => {
             // Tcl braces preserve spaces and Windows backslashes. Reject an unmatched

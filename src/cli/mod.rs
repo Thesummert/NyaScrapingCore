@@ -10,6 +10,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "help" || args[0] == "--help" {
         println!("nsc debugger management\n\n  list [openocd|pyocd|probe-rs]\n  install <tool> [version]\n  uninstall <tool> <version>\n  add-local <tool> <name> <directory>\n  remove-local <tool> <name>\n  use <tool> <version|system|local:name>\n  which <tool>\n  paths\n  gdbserver <tool> --target <target> [--interface <config>] [--port <port>] [--dry-run]\n  flash <tool> --target <target> --file <firmware> [--interface <config>] [--dry-run]\n  erase <tool> --target <target> [--interface <config>] [--bank <number>] [--dry-run]\n  reset <tool> --target <target> [--interface <config>] [--dry-run]\n  debug <tool> --target <target> --file <elf> [--interface <config>] [--port <port>] [--gdb <program>] [--dry-run]\n\nOpenOCD requires --interface; its --target is a target config. OpenOCD erase requires --bank. For pyOCD and probe-rs, --target is a chip name. Default port: 3333. Default GDB client: arm-none-eabi-gdb.");
+        println!("OpenOCD also accepts --transport swd|jtag|hla_swd|hla_jtag. Built-in interface/jlink.cfg defaults to SWD; use --transport jtag for JTAG wiring.");
         return Ok(());
     }
     let manager = Manager::new()?;
@@ -154,6 +155,7 @@ struct ParsedOptions {
 fn parse_options(args: &[String]) -> Result<ParsedOptions, Box<dyn std::error::Error>> {
     let mut target = None;
     let mut interface = None;
+    let mut transport = None;
     let mut port = None;
     let mut dry_run = false;
     let mut file = None;
@@ -172,7 +174,7 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions, Box<dyn std::error::E
         }
         if !matches!(
             flag,
-            "--target" | "--interface" | "--port" | "--file" | "--bank" | "--gdb"
+            "--target" | "--interface" | "--transport" | "--port" | "--file" | "--bank" | "--gdb"
         ) {
             return Err(format!("unknown option: {flag}").into());
         }
@@ -185,6 +187,7 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions, Box<dyn std::error::E
         match flag {
             "--target" if target.is_none() => target = Some(value.clone()),
             "--interface" if interface.is_none() => interface = Some(value.clone()),
+            "--transport" if transport.is_none() => transport = Some(value.clone()),
             "--port" if port.is_none() => {
                 port = Some(
                     value
@@ -209,6 +212,7 @@ fn parse_options(args: &[String]) -> Result<ParsedOptions, Box<dyn std::error::E
         server: GdbServerOptions {
             target: target.ok_or("missing --target")?,
             interface,
+            transport,
             port: port.unwrap_or(3333),
         },
         dry_run,
@@ -229,6 +233,28 @@ mod tests {
         assert_eq!(parsed.server.port, 4444);
         assert_eq!(parsed.server.target, "STM32F407VG");
         assert!(parsed.dry_run);
+        let with_transport =
+            ["--target", "target/stm32h7x.cfg", "--transport", "swd"].map(str::to_owned);
+        assert_eq!(
+            parse_options(&with_transport)
+                .unwrap()
+                .server
+                .transport
+                .as_deref(),
+            Some("swd")
+        );
+        assert!(parse_options(
+            &[
+                "--target",
+                "chip",
+                "--transport",
+                "swd",
+                "--transport",
+                "jtag"
+            ]
+            .map(str::to_owned)
+        )
+        .is_err());
         assert!(
             parse_options(&["--target".into(), "a".into(), "--target".into(), "b".into()]).is_err()
         );
