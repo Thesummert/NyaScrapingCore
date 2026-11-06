@@ -5,7 +5,17 @@ pub fn gdbserver_command(executable: &Path, options: &GdbServerOptions) -> Comma
     let mut command = Command::new(executable);
     command
         .args(["gdbserver", "--target", &options.target, "--port"])
-        .arg(options.port.to_string());
+        .arg(options.port.to_string())
+        // The default halt mode resets some STM32 targets during discovery.
+        // On STM32H723 this asserts if J-Link cannot observe NRST held low.
+        // Attach to the existing firmware without requiring hardware reset.
+        .args(["--connect", "attach"]);
+    if options.target.eq_ignore_ascii_case("stm32h723xx") {
+        // Connecting J-Link to the known core enables its native block-memory
+        // interface on AP0. Otherwise even comparing unchanged flash uses slow
+        // per-word DAP transfers. Other probe drivers ignore this option.
+        command.args(["-O", "jlink.device=Cortex-M7"]);
+    }
     command
 }
 

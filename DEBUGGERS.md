@@ -41,6 +41,8 @@ nsc debug probe-rs --target STM32F407VG --file build/app.elf
 
 `gdbserver` 对三种工具使用同一命令格式，启动前会根据 `use` 保存的选择寻找可执行文件；未选择时使用 PATH。`--port` 默认为 3333，允许 1 到 65535。OpenOCD 必须提供 `--interface`，其 `--target` 是目标配置文件；pyOCD 和 probe-rs 的 `--target` 是芯片名，不接受 `--interface`。`--dry-run` 只打印要执行的进程及参数。启动后，服务在前台运行，可从另一个终端用 GDB 连接 `localhost:3333`（或指定端口）。库调用方可使用 `backend::gdbserver_command` 和 `GdbServerOptions` 构造对应的 `std::process::Command`。
 
+pyOCD 调试服务显式使用 `--connect attach`，附加到现有固件。默认 `halt` 模式会在 STM32H723 的发现流程中执行硬件复位，J-Link 无法读到 NRST 被拉低时会在 `safe_reset_and_halt` 中触发断言，表现为读取 DP IDR 后服务退出且仅输出 `Error:`。附加模式避开这条复位流程；若目标已进入无法访问的低功耗状态，仍需先恢复目标的调试访问。连接模式说明参见 [pyOCD session options](https://pyocd.io/docs/options.html)。内置 `stm32h723xx` 目标还设置 `jlink.device=Cortex-M7`，启用 J-Link 在 AP0 上的原生块内存接口，减少烧录前比较和数据传输耗时；其他探针驱动忽略此选项。
+
 `flash` 烧录并校验固件；OpenOCD 使用其 `program ... verify reset exit` 流程，固件应为 ELF、HEX 或 S19，其他格式按各工具支持情况使用。`erase` 对 pyOCD 和 probe-rs 执行芯片擦除；OpenOCD 必须用 `--bank` 指定要擦除的 flash bank 编号，可用原生 `flash banks` 查看。擦除有目标芯片差异，执行前建议先用 `--dry-run` 核对命令。`reset` 复位目标。`debug` 启动 GDB 服务、等待端口可连接、打开 `arm-none-eabi-gdb` 并自动执行 `target remote localhost:<端口>`，GDB 退出时关闭服务；可用 `--gdb` 指定其他 GDB 程序。库调用方可使用 `backend::operation_command` 和 `Operation` 构造烧录、擦除及复位命令，并使用 `session::run` 管理调试会话。
 
 省略版本时会查询对应软件源的最新稳定版，OpenOCD 选择包含当前平台二进制文件的最新 xPack 正式发布。下载和构建进度由 curl、pip 或 Cargo 显示，具体形式取决于工具和终端；probe-rs 从源码构建，Cargo 的进度包含编译阶段。

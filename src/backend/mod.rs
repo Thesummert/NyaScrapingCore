@@ -176,7 +176,15 @@ mod tests {
                 .get_args()
                 .map(|v| v.to_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["gdbserver", "--target", "STM32F407VG", "--port", "4444"]
+            [
+                "gdbserver",
+                "--target",
+                "STM32F407VG",
+                "--port",
+                "4444",
+                "--connect",
+                "attach"
+            ]
         );
         let command = gdbserver_command(Tool::ProbeRs, exe, &options).unwrap();
         assert_eq!(
@@ -192,6 +200,26 @@ mod tests {
                 "127.0.0.1:4444"
             ]
         );
+    }
+
+    #[test]
+    fn h723_jlink_uses_the_known_core_for_block_memory_transfers() {
+        let mut options = GdbServerOptions {
+            target: "stm32h723xx".into(),
+            interface: None,
+            transport: None,
+            port: 3333,
+        };
+        for target in ["stm32h723xx", "STM32H723XX", "cortex_m", "stm32f407vg"] {
+            options.target = target.into();
+            let command = gdbserver_command(Tool::PyOcd, Path::new("pyocd"), &options).unwrap();
+            assert_eq!(
+                command
+                    .get_args()
+                    .any(|arg| arg == "jlink.device=Cortex-M7"),
+                target.eq_ignore_ascii_case("stm32h723xx")
+            );
+        }
     }
 
     #[test]
